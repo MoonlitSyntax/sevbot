@@ -1,4 +1,4 @@
-package bot
+package sevbot
 
 // TextMessage 创建文本消息
 func TextMessage(text string) MessageChain {
