@@ -1,6 +1,7 @@
 package sevbot
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -10,7 +11,7 @@ import (
 // LoggingMiddleware 日志记录中间件
 func LoggingMiddleware(logger *slog.Logger) Middleware {
 	return func(next EventHandlerFunc) EventHandlerFunc {
-		return func(event Event) error {
+		return func(ctx context.Context, event Event) error {
 			start := time.Now()
 
 			// 获取事件类型信息
@@ -46,7 +47,7 @@ func LoggingMiddleware(logger *slog.Logger) Middleware {
 				"event_info", eventInfo)
 
 			// 执行处理器
-			err := next(event)
+			err := next(ctx, event)
 
 			duration := time.Since(start)
 
@@ -69,7 +70,7 @@ func LoggingMiddleware(logger *slog.Logger) Middleware {
 // RecoveryMiddleware panic恢复中间件
 func RecoveryMiddleware(logger *slog.Logger) Middleware {
 	return func(next EventHandlerFunc) EventHandlerFunc {
-		return func(event Event) (err error) {
+		return func(ctx context.Context, event Event) (err error) {
 			defer func() {
 				if r := recover(); r != nil {
 					stack := debug.Stack()
@@ -84,7 +85,7 @@ func RecoveryMiddleware(logger *slog.Logger) Middleware {
 				}
 			}()
 
-			return next(event)
+			return next(ctx, event)
 		}
 	}
 }
@@ -92,10 +93,10 @@ func RecoveryMiddleware(logger *slog.Logger) Middleware {
 // MetricsMiddleware 指标统计中间件
 func MetricsMiddleware() Middleware {
 	return func(next EventHandlerFunc) EventHandlerFunc {
-		return func(event Event) error {
+		return func(ctx context.Context, event Event) error {
 			start := time.Now()
 
-			err := next(event)
+			err := next(ctx, event)
 
 			duration := time.Since(start)
 			eventType := fmt.Sprintf("%T", event)
@@ -114,18 +115,21 @@ func RateLimitMiddleware(maxEventsPerSecond int) Middleware {
 	ticker := time.NewTicker(time.Second / time.Duration(maxEventsPerSecond))
 
 	return func(next EventHandlerFunc) EventHandlerFunc {
-		return func(event Event) error {
-			<-ticker.C // 等待令牌
-			return next(event)
+		return func(ctx context.Context, event Event) error {
+			select {
+			case <-ticker.C: // 等待令牌
+				return next(ctx, event)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 }
 
 // AuthMiddleware 权限验证中间件
-// TODO: 完善
 func AuthMiddleware(allowedUsers map[int64]bool) Middleware {
 	return func(next EventHandlerFunc) EventHandlerFunc {
-		return func(event Event) error {
+		return func(ctx context.Context, event Event) error {
 			var userID int64
 
 			switch e := event.(type) {
@@ -135,14 +139,14 @@ func AuthMiddleware(allowedUsers map[int64]bool) Middleware {
 				userID = e.UserID
 			default:
 				// 非用户消息，直接通过
-				return next(event)
+				return next(ctx, event)
 			}
 
 			if allowedUsers != nil && !allowedUsers[userID] {
 				return fmt.Errorf("user %d not authorized", userID)
 			}
 
-			return next(event)
+			return next(ctx, event)
 		}
 	}
 }
@@ -150,11 +154,11 @@ func AuthMiddleware(allowedUsers map[int64]bool) Middleware {
 // FilterMiddleware 事件过滤中间件
 func FilterMiddleware(filter func(Event) bool) Middleware {
 	return func(next EventHandlerFunc) EventHandlerFunc {
-		return func(event Event) error {
+		return func(ctx context.Context, event Event) error {
 			if !filter(event) {
 				return nil // 过滤掉，不执行后续处理
 			}
-			return next(event)
+			return next(ctx, event)
 		}
 	}
 }

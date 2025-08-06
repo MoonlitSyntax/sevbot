@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,19 +62,17 @@ type WebSocketAdapter struct {
 	logger  *slog.Logger
 
 	// 状态
-	connected      atomic.Bool
-	messagesSent   atomic.Int64
-	messagesRecv   atomic.Int64
-	reconnectCount atomic.Int64
+	connected    atomic.Bool
+	messagesSent atomic.Int64
+	messagesRecv atomic.Int64
 
 	// API调用管理
 	pendingCalls sync.Map // map[string]chan *APIResponse
 	callID       atomic.Int64
 
-	// 心跳管理
-	lastHeartbeat  time.Time
-	heartbeatTimer *time.Timer
-	heartbeatMu    sync.RWMutex
+	// 分离的组件
+	heartbeat *HeartbeatManager
+	reconnect *ReconnectManager
 }
 
 // NewWebSocketAdapter 创建WebSocket适配器
@@ -90,11 +90,28 @@ func NewWebSocketAdapter(config WebSocketConfig) *WebSocketAdapter {
 		config.ResponseTimeout = 30 * time.Second
 	}
 
-	return &WebSocketAdapter{
+	adapter := &WebSocketAdapter{
 		config:  config,
-		eventCh: make(chan []byte, 100),
+		eventCh: make(chan []byte, 1000), // 增加缓冲区大小
 		logger:  slog.Default(),
 	}
+
+	// 初始化分离的组件
+	adapter.heartbeat = NewHeartbeatManager(config, adapter.logger)
+	adapter.heartbeat.SetTimeoutHandler(func() {
+		adapter.closeConnection()
+	})
+
+	if config.AutoReconnect {
+		adapter.reconnect = NewReconnectManager(
+			DefaultReconnectStrategy(),
+			adapter.connect,
+			adapter.IsConnected,
+			adapter.logger,
+		)
+	}
+
+	return adapter
 }
 
 // Connect 连接到WebSocket服务器
@@ -105,18 +122,23 @@ func (a *WebSocketAdapter) Connect(ctx context.Context) error {
 		return fmt.Errorf("initial connection failed: %w", err)
 	}
 
+	// 设置组件的上下文
+	a.heartbeat.SetContext(a.ctx)
+	if a.reconnect != nil {
+		a.reconnect.SetContext(a.ctx)
+	}
+
 	// 启动消息处理
 	go a.handleMessages()
 
-	// 启动重连协程
-	if a.config.AutoReconnect {
-		go a.reconnectLoop()
+	// 启动分离的组件
+	if a.reconnect != nil {
+		a.reconnect.Start()
 	}
+	a.heartbeat.Start()
 
-	// 启动心跳
-	if a.config.PingInterval > 0 {
-		go a.heartbeatLoop()
-	}
+	// 启动定期清理
+	a.startPendingCallCleanup()
 
 	return nil
 }
@@ -165,6 +187,9 @@ func (a *WebSocketAdapter) connect() error {
 	a.mu.Lock()
 	a.conn = conn
 	a.mu.Unlock()
+
+	// 更新心跳管理器的连接
+	a.heartbeat.SetConnection(conn)
 
 	a.connected.Store(true)
 	a.logger.Info("WebSocket connected", "url", a.config.URL)
@@ -219,121 +244,42 @@ func (a *WebSocketAdapter) handleMessages() {
 			}
 
 			// 检查是否是心跳事件
-			if a.handleHeartbeat(message) {
+			if a.heartbeat.HandleHeartbeatEvent(message) {
 				continue
 			}
 
-			// 否则作为事件分发
-			select {
-			case a.eventCh <- message:
-			case <-a.ctx.Done():
-				return
-			default:
-				a.logger.Warn("Event channel full, dropping message")
-			}
+			// 否则作为事件分发，使用智能背压策略
+			a.handleEventBackpressure(message)
 		}
 	}
 }
 
-// reconnectLoop 重连循环
-func (a *WebSocketAdapter) reconnectLoop() {
-	ticker := time.NewTicker(a.config.ReconnectDelay)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-ticker.C:
-			if !a.connected.Load() {
-				a.logger.Info("Attempting to reconnect...")
-				if err := a.connect(); err != nil {
-					a.logger.Error("Reconnection failed", "error", err)
-				} else {
-					a.reconnectCount.Add(1)
-					a.logger.Info("Reconnected successfully", "count", a.reconnectCount.Load())
-				}
-			}
-		}
-	}
-}
-
-// handleHeartbeat 处理心跳事件
-func (a *WebSocketAdapter) handleHeartbeat(message []byte) bool {
-	var event HeartbeatMetaEvent
-	if err := json.Unmarshal(message, &event); err != nil {
-		return false
+// handleEventBackpressure 简化的背压策略：阻塞一段时间，超时则丢弃并记录日志
+func (a *WebSocketAdapter) handleEventBackpressure(message []byte) {
+	// 首先尝试非阻塞发送
+	select {
+	case a.eventCh <- message:
+		return // 发送成功
+	default:
+		// 通道已满，尝试短时间阻塞
 	}
 
-	// 检查是否是心跳事件
-	if event.PostType != PostTypeMetaEvent || event.MetaEventType != MetaEventTypeHeartbeat {
-		return false
-	}
-
-	a.logger.Debug("Received heartbeat",
-		"interval", event.Interval,
-		"status", event.Status)
-
-	// 更新最后心跳时间
-	a.heartbeatMu.Lock()
-	a.lastHeartbeat = time.Now()
-
-	// 重置心跳检测计时器
-	if a.heartbeatTimer != nil {
-		a.heartbeatTimer.Stop()
-	}
-
-	// 设置新的超时检测，允许一定的容错时间
-	heartbeatTimeout := time.Duration(event.Interval)*time.Millisecond + 10*time.Second
-	a.heartbeatTimer = time.AfterFunc(heartbeatTimeout, func() {
-		a.logger.Warn("Heartbeat timeout, connection may be lost",
-			"last_heartbeat", a.lastHeartbeat,
-			"timeout", heartbeatTimeout)
-		a.closeConnection()
-	})
-	a.heartbeatMu.Unlock()
-
-	// 刷新WebSocket读取超时
-	if a.config.ReadTimeout > 0 {
-		a.mu.RLock()
-		if a.conn != nil {
-			a.conn.SetReadDeadline(time.Now().Add(a.config.ReadTimeout))
-		}
-		a.mu.RUnlock()
-	}
-
-	return true
-}
-
-// heartbeatLoop 心跳循环
-func (a *WebSocketAdapter) heartbeatLoop() {
-	ticker := time.NewTicker(a.config.PingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-ticker.C:
-			a.mu.RLock()
-			conn := a.conn
-			a.mu.RUnlock()
-
-			if conn != nil {
-				if a.config.WriteTimeout > 0 {
-					conn.SetWriteDeadline(time.Now().Add(a.config.WriteTimeout))
-				}
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					a.logger.Warn("Ping failed", "error", err)
-					a.closeConnection()
-				}
-			}
-		}
+	// 阻塞等待最多100ms
+	select {
+	case a.eventCh <- message:
+		return // 发送成功
+	case <-time.After(100 * time.Millisecond):
+		// 超时，记录日志并丢弃消息
+		a.logger.Warn("Event channel full, dropping message after timeout",
+			"channel_len", len(a.eventCh),
+			"channel_cap", cap(a.eventCh))
+	case <-a.ctx.Done():
+		return
 	}
 }
 
 // CallAction 调用API
-func (a *WebSocketAdapter) CallAction(actionName string, params map[string]any) ([]byte, error) {
+func (a *WebSocketAdapter) CallAction(ctx context.Context, actionName string, params map[string]any) ([]byte, error) {
 	if !a.connected.Load() {
 		return nil, fmt.Errorf("websocket not connected")
 	}
@@ -363,10 +309,6 @@ func (a *WebSocketAdapter) CallAction(actionName string, params map[string]any) 
 	if err := a.sendJSON(request); err != nil {
 		return nil, fmt.Errorf("send request failed: %w", err)
 	}
-
-	// 等待响应
-	ctx, cancel := context.WithTimeout(a.ctx, a.config.ResponseTimeout)
-	defer cancel()
 
 	select {
 	case resp := <-respCh:
@@ -421,6 +363,9 @@ func (a *WebSocketAdapter) Disconnect() error {
 		a.cancel()
 	}
 
+	// 清理所有待处理的API调用
+	a.cleanupPendingCalls()
+	
 	a.closeConnection()
 	close(a.eventCh)
 
@@ -439,13 +384,103 @@ func (a *WebSocketAdapter) closeConnection() {
 	}
 	a.connected.Store(false)
 
-	// 清理心跳计时器
-	a.heartbeatMu.Lock()
-	if a.heartbeatTimer != nil {
-		a.heartbeatTimer.Stop()
-		a.heartbeatTimer = nil
+	// 清理心跳管理器
+	a.heartbeat.Stop()
+}
+
+// cleanupPendingCalls 清理所有待处理的API调用，防止goroutine泄漏
+func (a *WebSocketAdapter) cleanupPendingCalls() {
+	a.logger.Info("Cleaning up pending API calls")
+	
+	// 遍历并关闭所有等待中的响应通道
+	pendingCount := 0
+	a.pendingCalls.Range(func(key, value interface{}) bool {
+		if ch, ok := value.(chan *APIResponse); ok {
+			// 发送取消错误并关闭通道
+			select {
+			case ch <- &APIResponse{
+				Status:  "failed",
+				RetCode: -1,
+				Message: "Connection closed",
+			}:
+			default:
+				// 通道可能已满，直接关闭
+			}
+			close(ch)
+			pendingCount++
+		}
+		a.pendingCalls.Delete(key)
+		return true
+	})
+	
+	if pendingCount > 0 {
+		a.logger.Warn("Cleaned up pending API calls", "count", pendingCount)
 	}
-	a.heartbeatMu.Unlock()
+}
+
+// startPendingCallCleanup 启动定期清理超时的API调用
+func (a *WebSocketAdapter) startPendingCallCleanup() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second) // 每30秒清理一次
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-ticker.C:
+				a.cleanupTimeoutCalls()
+			}
+		}
+	}()
+}
+
+// cleanupTimeoutCalls 清理超时的API调用
+func (a *WebSocketAdapter) cleanupTimeoutCalls() {
+	now := time.Now()
+	timeoutDuration := a.config.ResponseTimeout
+	if timeoutDuration == 0 {
+		timeoutDuration = 30 * time.Second
+	}
+	
+	var timedOutCalls []interface{}
+	
+	a.pendingCalls.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok {
+			// 从key中提取时间戳（格式：call_timestamp_id）
+			parts := strings.Split(keyStr, "_")
+			if len(parts) >= 2 {
+				if timestamp, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+					callTime := time.Unix(0, timestamp)
+					if now.Sub(callTime) > timeoutDuration {
+						timedOutCalls = append(timedOutCalls, key)
+					}
+				}
+			}
+		}
+		return true
+	})
+	
+	// 清理超时的调用
+	for _, key := range timedOutCalls {
+		if value, ok := a.pendingCalls.LoadAndDelete(key); ok {
+			if ch, ok := value.(chan *APIResponse); ok {
+				select {
+				case ch <- &APIResponse{
+					Status:  "failed",
+					RetCode: -1,
+					Message: "Request timeout",
+				}:
+				default:
+				}
+				close(ch)
+			}
+		}
+	}
+	
+	if len(timedOutCalls) > 0 {
+		a.logger.Warn("Cleaned up timeout API calls", "count", len(timedOutCalls))
+	}
 }
 
 // IsConnected 检查连接状态
@@ -455,16 +490,21 @@ func (a *WebSocketAdapter) IsConnected() bool {
 
 // Stats 获取统计信息
 func (a *WebSocketAdapter) Stats() interface{} {
-	a.heartbeatMu.RLock()
-	lastHeartbeat := a.lastHeartbeat
-	a.heartbeatMu.RUnlock()
-
-	return map[string]interface{}{
+	lastHeartbeat := a.heartbeat.GetLastHeartbeat()
+	
+	stats := map[string]interface{}{
 		"messages_sent":     a.messagesSent.Load(),
 		"messages_received": a.messagesRecv.Load(),
-		"reconnect_count":   a.reconnectCount.Load(),
 		"connected":         a.connected.Load(),
 		"last_heartbeat":    lastHeartbeat,
 		"heartbeat_active":  !lastHeartbeat.IsZero(),
 	}
+
+	if a.reconnect != nil {
+		stats["reconnect_count"] = a.reconnect.GetReconnectCount()
+	} else {
+		stats["reconnect_count"] = 0
+	}
+
+	return stats
 }

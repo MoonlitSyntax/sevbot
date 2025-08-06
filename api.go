@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"time"
 )
 
 // APIResponse OneBot标准API响应格式
@@ -21,7 +20,6 @@ type APIResponse struct {
 type APIClient struct {
 	adapter Adapter
 	logger  *slog.Logger
-	timeout time.Duration
 }
 
 // NewAPIClient 创建API客户端
@@ -29,19 +27,11 @@ func NewAPIClient(adapter Adapter) *APIClient {
 	return &APIClient{
 		adapter: adapter,
 		logger:  slog.Default(),
-		timeout: 30 * time.Second,
 	}
 }
 
 // callAPI 内部API调用方法，处理OneBot协议兼容性
 func (c *APIClient) callAPI(ctx context.Context, action string, params any, result any) error {
-	// 设置默认超时
-	if ctx == nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), c.timeout)
-		defer cancel()
-	}
-
 	// 转换参数
 	paramMap, err := c.structToMap(params)
 	if err != nil {
@@ -49,7 +39,7 @@ func (c *APIClient) callAPI(ctx context.Context, action string, params any, resu
 	}
 
 	// 调用适配器
-	data, err := c.adapter.CallAction(action, paramMap)
+	data, err := c.adapter.CallAction(ctx, action, paramMap)
 	if err != nil {
 		c.logger.Error("API call failed", "action", action, "error", err)
 		return err
@@ -100,6 +90,18 @@ func (c *APIClient) structToMap(v any) (map[string]any, error) {
 		return m, nil
 	}
 
+	// 优先使用生成的ToMap方法
+	if mapper, ok := v.(ToMapper); ok {
+		return mapper.ToMap(), nil
+	}
+
+	// 回退到JSON方式（避免复杂的反射代码）
+	return c.structToMapJSON(v)
+}
+
+
+// structToMapJSON 回退到JSON方式的转换
+func (c *APIClient) structToMapJSON(v any) (map[string]any, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
@@ -111,6 +113,60 @@ func (c *APIClient) structToMap(v any) (map[string]any, error) {
 	}
 
 	return result, nil
+}
+
+// CallAPITyped 泛型版本的API调用方法，提供编译时类型安全
+func CallAPITyped[T any](c *APIClient, ctx context.Context, action string, params any) (*T, error) {
+	var result T
+	err := c.callAPI(ctx, action, params, &result)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// CallAPITypedResponse 返回完整的类型化响应
+func CallAPITypedResponse[T any](c *APIClient, ctx context.Context, action string, params any) (*APITypedResponse[T], error) {
+	// 转换参数
+	paramMap, err := c.structToMap(params)
+	if err != nil {
+		return nil, fmt.Errorf("convert params failed: %w", err)
+	}
+
+	// 调用适配器
+	data, err := c.adapter.CallAction(ctx, action, paramMap)
+	if err != nil {
+		c.logger.Error("API call failed", "action", action, "error", err)
+		return nil, err
+	}
+
+	// 直接解析到类型化响应
+	var resp APITypedResponse[T]
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("parse typed response failed: %w", err)
+	}
+
+	// OneBot协议兼容性处理
+	if resp.Status != "ok" && resp.Status != "" {
+		c.logger.Error("API returned error",
+			"action", action,
+			"status", resp.Status,
+			"retcode", resp.Retcode,
+			"message", resp.Message)
+		return nil, NewBotError(ErrorTypeAPI, resp.Retcode, resp.Message, nil)
+	}
+
+	// 检查retcode
+	if resp.Status == "" && resp.Retcode != 0 {
+		c.logger.Error("API returned error",
+			"action", action,
+			"status", resp.Status,
+			"retcode", resp.Retcode,
+			"message", resp.Message)
+		return nil, NewBotError(ErrorTypeAPI, resp.Retcode, resp.Message, nil)
+	}
+
+	return &resp, nil
 }
 
 type SendPrivateMessageRequest struct {
@@ -129,9 +185,7 @@ func (c *APIClient) SendPrivateMessage(ctx context.Context, userID int64, messag
 		UserID:  userID,
 		Message: message,
 	}
-	var resp SendMessageResponse
-	err := c.callAPI(ctx, "send_private_msg", req, &resp)
-	return &resp, err
+	return CallAPITyped[SendMessageResponse](c, ctx, "send_private_msg", req)
 }
 
 // SendGroupMessage 发送群消息
@@ -140,9 +194,7 @@ func (c *APIClient) SendGroupMessage(ctx context.Context, groupID int64, message
 		GroupID: groupID,
 		Message: message,
 	}
-	var resp SendMessageResponse
-	err := c.callAPI(ctx, "send_group_msg", req, &resp)
-	return &resp, err
+	return CallAPITyped[SendMessageResponse](c, ctx, "send_group_msg", req)
 }
 
 // DeleteMessage 撤回消息

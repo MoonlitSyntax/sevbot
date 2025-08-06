@@ -1,6 +1,7 @@
 package sevbot
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync"
@@ -14,8 +15,8 @@ type EventBus struct {
 	mu          sync.RWMutex
 }
 
-// EventHandlerFunc 简化的事件处理函数
-type EventHandlerFunc func(event Event) error
+// EventHandlerFunc 支持上下文的事件处理函数
+type EventHandlerFunc func(ctx context.Context, event Event) error
 
 // Middleware 中间件函数
 type Middleware func(next EventHandlerFunc) EventHandlerFunc
@@ -39,9 +40,9 @@ func (b *EventBus) Subscribe(eventType reflect.Type, handler EventHandlerFunc) e
 }
 
 // dispatch 分发事件，移除Context复杂性
-func (b *EventBus) dispatch(bot *Bot, rawEvent []byte) error {
+func (b *EventBus) dispatch(client *Client, rawEvent []byte) error {
 	// 解析事件
-	event, err := bot.adapter.ParseEvent(rawEvent)
+	event, err := client.adapter.ParseEvent(rawEvent)
 	if err != nil {
 		return fmt.Errorf("failed to parse event: %w", err)
 	}
@@ -60,7 +61,7 @@ func (b *EventBus) dispatch(bot *Bot, rawEvent []byte) error {
 
 	// 生成请求ID用于日志
 	requestID := generateRequestID()
-	logger := bot.logger.With(
+	logger := client.logger.With(
 		"request_id", requestID,
 		"event_type", eventType.String(),
 	)
@@ -73,12 +74,13 @@ func (b *EventBus) dispatch(bot *Bot, rawEvent []byte) error {
 	for _, handler := range handlers {
 		// 获取信号量
 		select {
-		case bot.semaphore <- struct{}{}:
-		case <-bot.ctx.Done():
+		case client.semaphore <- struct{}{}:
+		case <-client.ctx.Done():
 			return fmt.Errorf("context cancelled, cannot dispatch event")
 		}
 
 		wg.Add(1)
+		client.handlerWG.Add(1) // 添加到客户端的 WaitGroup
 		go func(h EventHandlerFunc) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -87,7 +89,8 @@ func (b *EventBus) dispatch(bot *Bot, rawEvent []byte) error {
 						"event_type", eventType.String())
 					errorChan <- fmt.Errorf("panic recovered: %v", r)
 				}
-				<-bot.semaphore
+				<-client.semaphore
+				client.handlerWG.Done() // 完成时通知客户端 WaitGroup
 				wg.Done()
 			}()
 
@@ -97,15 +100,19 @@ func (b *EventBus) dispatch(bot *Bot, rawEvent []byte) error {
 				finalHandler = b.middlewares[i](finalHandler)
 			}
 
+			// 创建带超时的上下文
+			ctx, cancel := context.WithTimeout(client.ctx, 30*time.Second)
+			defer cancel()
+
 			// 执行处理器
-			if err := finalHandler(event); err != nil {
+			if err := finalHandler(ctx, event); err != nil {
 				logger.Error("Event handler error",
 					"error_type", getErrorType(err),
 					"error_code", getErrorCode(err),
 					"error", err.Error())
 
 				// 使用错误处理器
-				if handledErr := bot.errorHandler.HandleError(requestID, event, err); handledErr != nil {
+				if handledErr := client.errorHandler.HandleError(requestID, event, err); handledErr != nil {
 					errorChan <- handledErr
 				}
 			}

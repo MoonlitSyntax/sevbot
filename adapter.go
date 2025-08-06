@@ -11,7 +11,7 @@ type Adapter interface {
 	Disconnect() error
 
 	// CallAction 调用 API
-	CallAction(actionName string, params map[string]any) ([]byte, error)
+	CallAction(ctx context.Context, actionName string, params map[string]any) ([]byte, error)
 
 	// EventChannel 获取事件通道
 	EventChannel() <-chan []byte

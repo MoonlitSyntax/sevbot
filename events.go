@@ -3,6 +3,7 @@ package sevbot
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 )
 
 // PostType 定义了上报类型
@@ -277,6 +278,7 @@ func buildKey(postType, subType string) string {
 
 // UnmarshalEvent 是一个智能的事件解析函数（重构版）
 // 它接收原始的 JSON 数据，并使用注册表自动解析成对应的具体事件结构体
+// 保证始终返回指针类型以确保类型一致性
 func UnmarshalEvent(data []byte) (Event, error) {
 	var pre tempEvent
 	if err := json.Unmarshal(data, &pre); err != nil {
@@ -306,6 +308,15 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	event := constructor()
 	if err := json.Unmarshal(data, event); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal to concrete event type '%T': %w", event, err)
+	}
+
+	// 确保返回的总是指针类型，解决值类型/指针类型不一致的问题
+	eventValue := reflect.ValueOf(event)
+	if eventValue.Kind() != reflect.Ptr {
+		// 如果不是指针，创建一个指向该值的指针
+		ptrValue := reflect.New(eventValue.Type())
+		ptrValue.Elem().Set(eventValue)
+		return ptrValue.Interface().(Event), nil
 	}
 
 	return event, nil
